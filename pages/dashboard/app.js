@@ -25,6 +25,22 @@ function fmtTime(ts) {
     String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
 }
 
+function humanAge(ts) {
+  var s = Math.max(0, Date.now() / 1000 - ts);
+  if (s < 3600) return Math.max(1, Math.round(s / 60)) + " 分钟";
+  if (s < 48 * 3600) return (s / 3600).toFixed(1) + " 小时";
+  return (s / 86400).toFixed(1) + " 天";
+}
+
+// 凭证年龄：有 set_at（手动更新时刻）给精确值；老数据没有 set_at 时
+// 只能说「≥ 最早已知证据」，别把探测时间冒充更新时间
+function credAgeText(meta) {
+  if (!meta) return "";
+  if (meta.set_at) return "已 " + humanAge(meta.set_at);
+  var known = meta.last_ok_at || meta.last_expired_at || meta.last_net_fail_at;
+  return known ? "≥ " + humanAge(known) : "";
+}
+
 function muteText(until) {
   if (!until || until <= Date.now() / 1000) return "";
   return "🔕 至 " + fmtTime(until);
@@ -64,10 +80,12 @@ function render() {
   var muted = binds.filter(function (b) { return b.alert_muted_until > Date.now() / 1000; }).length;
 
   var credState = d.credential_state || "unknown";
+  var meta = d.credential_meta || {};
+  var age = credAgeText(meta);
   var credCard =
-    credState === "expired" ? { icon: "🔑", label: "学校凭证", value: "已失效", cls: "card-alert" }
-    : credState === "ok" ? { icon: "🔑", label: "学校凭证", value: "有效", cls: "card-success" }
-    : d.cookie_ok ? { icon: "🔑", label: "学校凭证", value: "已配置", cls: "" }
+    credState === "expired" ? { icon: "🔑", label: "学校凭证", value: "已失效" + (age ? " · " + age : ""), cls: "card-alert" }
+    : credState === "ok" ? { icon: "🔑", label: "学校凭证", value: "有效" + (age ? " · " + age : ""), cls: "card-success" }
+    : d.cookie_ok ? { icon: "🔑", label: "学校凭证", value: "已配置" + (age ? " · " + age : ""), cls: "" }
     : { icon: "🔑", label: "学校凭证", value: "未配置", cls: "card-alert" };
   var cards = [
     { icon: "🔗", label: "绑定会话", value: binds.length, cls: "" },
@@ -81,8 +99,16 @@ function render() {
   }).join("");
 
   var poll = d.poll_interval_minutes;
+  var keep = d.keepalive_interval_minutes;
+  var probe = [];
+  if (meta.last_ok_at) probe.push("学校最近确认 " + fmtTime(meta.last_ok_at));
+  if (meta.last_expired_at) probe.push("最近失效 " + fmtTime(meta.last_expired_at));
+  if (meta.last_net_fail_at) probe.push("最近失联 " + fmtTime(meta.last_net_fail_at));
   document.getElementById("global-meta").textContent =
-    "轮询 " + (poll ? poll + " 分钟" : "已关闭") + " · 每日播报 " + (d.daily_report ? d.daily_time : "已关闭");
+    "轮询 " + (poll ? poll + " 分钟" : "已关闭") +
+    " · 保活 " + (keep ? keep + " 分钟" : "已关闭") +
+    " · 每日播报 " + (d.daily_report ? d.daily_time : "已关闭") +
+    (probe.length ? " · " + probe.join(" · ") : "");
 
   // 会话选择器
   var sel = document.getElementById("session-selector");

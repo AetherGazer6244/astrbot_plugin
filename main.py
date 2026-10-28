@@ -183,7 +183,7 @@ def electric():
     PLUGIN_NAME,
     "Cecilian",
     "宿舍电费余额监控预警：低余额预警、每日播报、双费种同时查询、支持 AI 对话绑定与 WebUI 仪表盘",
-    "1.2.1",
+    "1.2.2",
 )
 class DormElectricPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -237,8 +237,17 @@ class DormElectricPlugin(Star):
                 max_instances=1,
                 coalesce=True,
             )
+        keep_min = self._cfg_int("keepalive_interval_minutes", 8)
+        if keep_min:
+            self.scheduler.add_job(
+                self._keepalive_tick,
+                IntervalTrigger(minutes=max(5, keep_min)),
+                id="keepalive",
+                max_instances=1,
+                coalesce=True,
+            )
         self.scheduler.start()
-        logger.info(f"[{PLUGIN_NAME}] 插件已初始化，轮询={poll_min}min")
+        logger.info(f"[{PLUGIN_NAME}] 插件已初始化，轮询={poll_min}min，保活={keep_min}min")
         self._register_dashboard()
 
         self._tasks.append(asyncio.create_task(self._startup_poll()))
@@ -550,10 +559,13 @@ class DormElectricPlugin(Star):
             try:
                 results = await self._fetch_fees(binding)
                 self._remember_raw(umo, results)
+                any_ok = False
+                any_expired = False
                 for kind, result in results.items():
                     if result is None:
                         continue
                     if result.ok and result.value is not None:
+                        any_ok = True
                         self.store.append_fee_history(
                             binding,
                             kind,
@@ -565,7 +577,18 @@ class DormElectricPlugin(Star):
                             umo, binding, result.value, kind, result.unit
                         )
                     elif result.session_expired:
+                        any_expired = True
                         await self._notify_session_dead(umo, binding)
+                if results:
+                    # 凭证埋点与 _sync_credential_state 同口径：任一路拿到余额
+                    # 即「学校认了」；全 91001 才算失效；网络/接口失败记失联。
+                    if any_ok:
+                        self._touch_credential(ok=True)
+                    elif any_expired:
+                        self._touch_credential(expired=True)
+                    else:
+                        self._touch_credential(net_fail=True)
+                self._sync_credential_state(umo, binding, any_ok, any_expired)
                 self._record_event(
                     umo, "poll", f"轮询：{self._binding_label(binding)}"
                 )
@@ -708,6 +731,112 @@ class DormElectricPlugin(Star):
                 f"{header}（{len(items)} 项）",
             )
 
+    def _sync_credential_state(
+        self, umo: str, binding: dict, any_ok: bool, any_expired: bool
+    ) -> None:
+        """同步「凭证失效」标记（持久化在 binding 里，重启后仍生效）。
+
+        判定口径与仪表盘 credential_state 一致：有 91001 且无任何一路拿到
+        余额才算失效——学校 5xx/网络全挂不算失效，标记保持原样（宁可多发
+        一次播报，也不要把临时抖动当成凭证过期）。
+
+        标记置位期间：只发凭证失效通知，不再在指定时间发每日播报
+        （播报内容读的是历史快照，凭证失效后发出去的是陈旧余额）。
+        凭证恢复（任一路取到余额）后立即清标记，当天播报即可恢复。
+        """
+        if any_expired and not any_ok:
+            if binding.get("credential_dead"):
+                return
+            binding["credential_dead"] = True
+            logger.info(
+                f"[{PLUGIN_NAME}] 凭证失效：{umo}（{self._binding_label(binding)}），"
+                "每日播报已暂停，仅发送凭证失效通知"
+            )
+            self._record_event(umo, "credential", "凭证失效，每日播报已暂停")
+            # force=True：标记直接决定用户可见行为（还要不要发播报），
+            # 不能等 60 秒去抖窗口——进程此刻崩了重启后就恢复成「发播报」。
+            self.store.save(force=True)
+            return
+        if any_ok and binding.get("credential_dead"):
+            binding["credential_dead"] = False
+            logger.info(
+                f"[{PLUGIN_NAME}] 凭证已恢复：{umo}（{self._binding_label(binding)}），"
+                "每日播报恢复"
+            )
+            self._record_event(umo, "credential", "凭证已恢复，每日播报恢复")
+            self.store.save(force=True)
+
+    def _touch_credential(
+        self, *, ok: bool = False, expired: bool = False, net_fail: bool = False
+    ) -> None:
+        """凭证生命周期埋点：记录学校最近一次「认 / 拒绝 / 失联」的时刻。
+
+        凭证是全局配置（hjnu_cookie），时间戳也全局记一份，存
+        store.data["credential"]（随历史落盘，重启不丢）：
+        - set_at：最后一次手动更新凭证（cmd_credential 写入）
+        - last_ok_at / last_expired_at / last_net_fail_at：轮询与保活探测写入
+        有了这组数据才能回答「这张票到底活了多久、死在几点」——
+        此前凭证失效完全无痕，只能事后猜。网络失败单独记、绝不混入
+        expired：学校夜里发癫时不能把「临时失联」误判成「凭证过期」。
+        """
+        if not self.store:
+            return
+        meta = self.store.data.setdefault("credential", {})
+        now = time.time()
+        if ok:
+            meta["last_ok_at"] = now
+        if expired:
+            meta["last_expired_at"] = now
+        if net_fail:
+            meta["last_net_fail_at"] = now
+        self.store.save()
+
+    async def _keepalive_tick(self):
+        """独立保活探测：与余额轮询解耦，没有绑定会话也照常打卡。
+
+        用 queryElecArea（只需 aid，是学校响应最轻的合法接口——带 aid 调
+        queryElecRoomInfo 反而 HTTP 500）探测凭证死活：
+        - 学校认 → 记 last_ok_at，并清除各会话 credential_dead（凭证活了，
+          被压住的每日播报恢复）
+        - 91001 → 记 last_expired_at，发失效通知（24h 去重与轮询共用）
+        - 网络/学校抖动 → 只记 last_net_fail_at，凭证状态一字不动
+        轮询间隔 20~30 分钟时，探测把「发现失效」的延迟从半小时缩到 8 分钟；
+        轮询关闭（poll_interval_minutes=0）时它是唯一的自动探测。
+        """
+        if not self.store or not self.hjnu:
+            return
+        if not str(self._cfg("hjnu_cookie", "") or "").strip():
+            return  # 没配凭证，探了必是 91001，白打一次请求
+        items = self.config.get("fee_items", {}) or {}
+        aid = next(iter(items), "")
+        if not aid:
+            return
+        try:
+            await self.hjnu.list_areas(aid)
+        except SessionExpiredError:
+            self._touch_credential(expired=True)
+            logger.warning(f"[{PLUGIN_NAME}] 保活探测：凭证已失效（91001）")
+            bindings = self.store.data.get("bindings", {})
+            for umo, binding in list(bindings.items()):
+                try:
+                    await self._notify_session_dead(umo, binding)
+                    self._sync_credential_state(umo, binding, False, True)
+                except Exception as e:
+                    logger.error(f"[{PLUGIN_NAME}] 保活失效处理 {umo} 失败：{e!r}")
+        except QueryError as e:
+            self._touch_credential(net_fail=True)
+            logger.error(
+                f"[{PLUGIN_NAME}] 保活探测失败（学校/网络抖动，不改凭证状态）：{e}"
+            )
+        else:
+            self._touch_credential(ok=True)
+            bindings = self.store.data.get("bindings", {})
+            for umo, binding in list(bindings.items()):
+                try:
+                    self._sync_credential_state(umo, binding, True, False)
+                except Exception as e:
+                    logger.error(f"[{PLUGIN_NAME}] 保活恢复处理 {umo} 失败：{e!r}")
+
     async def _notify_session_dead(self, umo: str, binding: dict):
         state = binding.setdefault("alert_state", {})
         now = time.time()
@@ -733,6 +862,15 @@ class DormElectricPlugin(Star):
         bindings = self.store.data.get("bindings", {})
         for umo, binding in list(bindings.items()):
             try:
+                if binding.get("credential_dead"):
+                    # 凭证失效：只发失效通知，不发每日播报（播报读的是历史
+                    # 快照，凭证失效后发出去的是陈旧余额，没意义还刷屏）。
+                    logger.info(
+                        f"[{PLUGIN_NAME}] 凭证失效，跳过每日播报：{umo}"
+                        f"（{self._binding_label(binding)}）"
+                    )
+                    self._record_event(umo, "credential", "凭证失效，今日播报已跳过")
+                    continue
                 if self._daily_muted_until(binding) > time.time():
                     continue
                 if binding.get("last_daily_date") == today:
@@ -2478,6 +2616,11 @@ class DormElectricPlugin(Star):
             logger.warning(f"[{PLUGIN_NAME}] 保存配置失败：{e!r}")
         if self.hjnu:
             self.hjnu.update_cookie(text)
+        if self.store:
+            # 凭证年龄埋点：set_at 是「凭证寿命」的起点。用户动作必须立刻
+            # 落盘（60 秒去抖会让进程崩溃时丢掉寿命起点，仪表盘就只能说「≥」）
+            self.store.data.setdefault("credential", {})["set_at"] = time.time()
+            self.store.save(force=True)
         umo = event.unified_msg_origin
         binding = self.store.get_binding(umo)
         if binding:

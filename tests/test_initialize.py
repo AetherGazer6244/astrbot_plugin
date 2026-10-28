@@ -55,9 +55,9 @@ def test_initialize_wires_store_provider_jobs_and_dashboard(data_path):
         assert plugin.store is not None
         assert plugin.store.path.parent.name == PLUGIN_NAME
         assert plugin.hjnu is not None
-        # 两个调度任务都在
+        # 三个调度任务都在（v1.2.2 起含独立保活探测）
         jobs = {job.id for job in plugin.scheduler.get_jobs()}
-        assert jobs == {"poll", "daily"}
+        assert jobs == {"poll", "daily", "keepalive"}
         # 仪表盘两个端点已注册
         paths = [r[0] for r in ctx.registered]
         assert f"/{PLUGIN_NAME}/dashboard/overview" in paths
@@ -72,13 +72,17 @@ def test_initialize_wires_store_provider_jobs_and_dashboard(data_path):
     _lifecycle(plugin, check)
 
 
-def test_initialize_respects_disabled_poll_and_daily(data_path):
+def test_initialize_respects_disabled_poll_daily_keepalive(data_path):
     def check(plugin: DormElectricPlugin):
         jobs = {job.id for job in plugin.scheduler.get_jobs()}
         assert jobs == set()  # 全关时不排任何任务
 
     plugin = make_plugin(
-        config={"poll_interval_minutes": 0, "daily_report": False},
+        config={
+            "poll_interval_minutes": 0,
+            "daily_report": False,
+            "keepalive_interval_minutes": 0,
+        },
         context=_FakeContext(),
     )
     _lifecycle(plugin, check)

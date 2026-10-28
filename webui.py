@@ -100,6 +100,7 @@ async def overview(plugin) -> dict:
     try:
         bindings = (plugin.store.data.get("bindings", {}) if plugin.store else {}) or {}
         cookie = str(plugin.config.get("hjnu_cookie", "") or "")
+        meta = dict(plugin.store.data.get("credential") or {}) if plugin.store else {}
         return {
             "success": True,
             "data": {
@@ -108,7 +109,14 @@ async def overview(plugin) -> dict:
                 ],
                 "cookie_ok": bool(cookie.strip()),
                 "credential_state": credential_state(plugin, bindings),
+                # 凭证生命周期埋点（纯时间戳，无凭证值）：
+                # set_at=最后一次手动更新；last_ok_at/last_expired_at/
+                # last_net_fail_at=学校最近一次认/拒绝/失联
+                "credential_meta": meta,
                 "poll_interval_minutes": plugin._cfg_int("poll_interval_minutes", 20),
+                "keepalive_interval_minutes": plugin._cfg_int(
+                    "keepalive_interval_minutes", 8
+                ),
                 "daily_time": str(plugin._cfg("daily_time", "08:00")),
                 "daily_report": plugin._cfg_bool("daily_report", True),
                 "server_time": time.time(),

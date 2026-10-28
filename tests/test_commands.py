@@ -255,3 +255,148 @@ def test_history_n_clamped_to_60():
     plugin = make_plugin(store=_Store({UMO: _binding()}))
     out = "".join(asyncio.run(_collect(plugin.cmd_history(_Ev(), "99999"))))
     assert "A-8-17" in out
+
+
+# ================= 凭证失效：只发失效通知，不发每日播报 =================
+
+AC_AID = "0030000000004301"
+ELEC_AID = "0030000000014501"
+
+
+def _expired():
+    return BalanceResult(
+        ok=False, value=None, raw="会话已超时", session_expired=True
+    )
+
+
+class _KindProvider:
+    """按 aid 返回结果的假 provider（_fetch_entry 传 {"params": params}）。"""
+
+    def __init__(self, results=None, missing=False):
+        self._results = results or {}
+        self._missing = missing
+        self.cookie = None
+
+    def update_cookie(self, cookie):
+        self.cookie = cookie
+
+    async def fetch(self, binding):
+        if self._missing:
+            return None
+        params = binding.get("params") or {}
+        return self._results.get(params.get("aid"))
+
+
+def _two_fee_binding():
+    b = _binding()
+    b["fees"] = {
+        "ac": {"provider": "hjnu", "params": {"aid": AC_AID}},
+        "elec": {"provider": "hjnu", "params": {"aid": ELEC_AID}},
+    }
+    b["history_by_fee"]["elec"] = [
+        {"t": time.time() - 86400, "v": 8.0, "u": "元"},
+        {"t": time.time(), "v": 7.0, "u": "元"},
+    ]
+    return b
+
+
+def _recorder():
+    sent = []
+
+    async def _send(umo, text):
+        sent.append((umo, text))
+        return True
+
+    return sent, _send
+
+
+def test_poll_marks_credential_dead_and_notifies():
+    """91001 → 标记失效 + 发失效通知（这是失效期唯一的推送）。"""
+    store = _Store({UMO: _two_fee_binding()})
+    plugin = make_plugin(
+        store=store,
+        hjnu=_KindProvider({AC_AID: _expired(), ELEC_AID: _expired()}),
+    )
+    sent, _send = _recorder()
+    plugin._send = _send
+
+    asyncio.run(plugin._poll_all())
+
+    binding = store.get_binding(UMO)
+    assert binding["credential_dead"] is True
+    assert len(sent) == 1  # 两个费种都失效，但 24h 去重后只发一条
+    assert "凭证已失效" in sent[0][1]
+    # 状态变化记进事件流（/电费 日志 可见）
+    assert any(e["kind"] == "credential" for e in plugin._events)
+
+
+def test_daily_skipped_when_credential_dead():
+    """凭证失效 → 每日播报不发，且不写 last_daily_date（修好当天能补发）。"""
+    store = _Store({UMO: _two_fee_binding()})
+    store.get_binding(UMO)["credential_dead"] = True
+    plugin = make_plugin(store=store)
+    sent, _send = _recorder()
+    plugin._send = _send
+
+    asyncio.run(plugin._daily_all())
+
+    assert sent == []
+    assert "last_daily_date" not in store.get_binding(UMO)
+
+
+def test_daily_still_sent_when_credential_alive():
+    """回归：凭证正常时每日播报照发。"""
+    store = _Store({UMO: _two_fee_binding()})
+    plugin = make_plugin(store=store)
+    sent, _send = _recorder()
+    plugin._send = _send
+
+    asyncio.run(plugin._daily_all())
+
+    assert len(sent) == 1
+    assert "每日电费播报" in sent[0][1]
+
+
+def test_poll_clears_credential_dead_on_recovery():
+    """凭证恢复 → 标记清除，当日播报恢复。"""
+    store = _Store({UMO: _two_fee_binding()})
+    store.get_binding(UMO)["credential_dead"] = True
+    plugin = make_plugin(
+        store=store,
+        hjnu=_KindProvider({AC_AID: _ok(50.0), ELEC_AID: _ok(8.0, "元")}),
+    )
+    sent, _send = _recorder()
+    plugin._send = _send
+
+    asyncio.run(plugin._poll_all())
+
+    binding = store.get_binding(UMO)
+    assert binding.get("credential_dead") is False
+    asyncio.run(plugin._daily_all())
+    assert any("每日电费播报" in text for _, text in sent)
+
+
+def test_poll_network_failure_keeps_credential_state():
+    """学校 5xx/网络全挂（结果全 None）不是失效，标记保持原样。"""
+    store = _Store({UMO: _two_fee_binding()})
+    store.get_binding(UMO)["credential_dead"] = True
+    plugin = make_plugin(store=store, hjnu=_KindProvider(missing=True))
+    sent, _send = _recorder()
+    plugin._send = _send
+
+    asyncio.run(plugin._poll_all())
+
+    assert store.get_binding(UMO)["credential_dead"] is True
+    assert sent == []  # 网络故障不发失效通知（不是凭证问题）
+
+
+def test_poll_failure_does_not_mark_credential_dead():
+    """全新绑定遇到网络故障：不应被误判成凭证失效。"""
+    store = _Store({UMO: _two_fee_binding()})
+    plugin = make_plugin(store=store, hjnu=_KindProvider(missing=True))
+    _sent, _send = _recorder()
+    plugin._send = _send
+
+    asyncio.run(plugin._poll_all())
+
+    assert not store.get_binding(UMO).get("credential_dead")
