@@ -4,4 +4,4 @@ desc: 宿舍电费余额监控预警：低余额/紧急预警（支持分费种�
 short_desc: 宿舍电费余额监控、低余额预警，支持 AI 对话绑定。
 version: v1.2.2
 author: Cecilian
-repo: https://github.com/Cecilian-Elysian/astrbot_plugin_dorm_electric
+repo: https://github.com/AetherGazer6244/astrbot_plugin
