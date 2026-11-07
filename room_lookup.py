@@ -232,11 +232,29 @@ def fuzzy_miss_text(
 class RoomResolver:
     """按房间名反查学校侧房间参数。last_room 由宿主持有并跨调用共享。"""
 
-    def __init__(self, hjnu, store, config: dict, last_room: dict):
+    def __init__(
+        self,
+        hjnu,
+        store,
+        config: dict,
+        last_room: dict,
+        credential_hint=None,
+    ):
         self._hjnu = hjnu
         self._store = store
         self._config = config
         self._last_room = last_room
+        # 凭证提示语由宿主持有（连续确认未达标的「疑似失效」文案与确认失效不同，
+        # 不能在这里写死 CREDENTIAL_HINT）。没注入时退回默认文案。
+        self._credential_hint = credential_hint
+
+    def _cred_hint(self) -> str:
+        if callable(self._credential_hint):
+            try:
+                return self._credential_hint()
+            except Exception:
+                return CREDENTIAL_HINT
+        return CREDENTIAL_HINT
 
     async def resolve(self, umo: str, hint: str) -> tuple[dict | None, str | None]:
         """按房间名反查学校侧的房间参数。返回 (ac_params, err)。
@@ -267,7 +285,7 @@ class RoomResolver:
                 return None, "学校没有返回校区列表。"
             buildings = await self._hjnu.list_buildings(aid, area)
         except SessionExpiredError:
-            return None, CREDENTIAL_HINT
+            return None, self._cred_hint()
         except QueryError as e:
             return None, f"❌ {e}"
         if not buildings:
@@ -301,7 +319,7 @@ class RoomResolver:
             )
         except SessionExpiredError:
             # 扫描途中会话过期：报「凭证过期」而不是「没找到房间」，避免误导
-            return None, CREDENTIAL_HINT
+            return None, self._cred_hint()
         if not floors_ok and floors_err:
             return None, (
                 f"❌ 学校接口异常（{floors_err[0]}），这次一个楼层都没扫到，"
@@ -352,7 +370,7 @@ class RoomResolver:
         try:
             results = await asyncio.gather(*(rooms_of(p) for p in pairs))
         except SessionExpiredError:
-            return None, CREDENTIAL_HINT
+            return None, self._cred_hint()
         if not rooms_ok and rooms_err:
             return None, (
                 f"❌ 学校接口异常（{rooms_err[0]}），这次房间列表都没拉到，"

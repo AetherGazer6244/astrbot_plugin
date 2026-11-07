@@ -90,11 +90,22 @@ class _FakeProvider:
 
 
 class _FakeStore:
+    """最小存储桩。
+
+    v1.3.0 起凭证失效判定带「连续 91001 计数」，main 会读 store.data
+    里的 credential 段——桩必须带上 .data，否则 _expired_strikes() 直接
+    AttributeError（这正是本文件 10 个用例集体变红的原因）。
+    """
+
     def __init__(self, binding):
         self._binding = binding
+        self.data = {"bindings": {UMO: binding} if binding else {}}
 
     def get_binding(self, umo):
         return self._binding
+
+    def save(self, force=False):
+        return None
 
 
 def _binding():
@@ -175,7 +186,21 @@ def test_check_events_are_newest_first():
 
 
 def test_check_reports_91001_instead_of_credential_unverified():
+    """连续确认未达标时是「疑似 + 观察中」，不是「已失效」。
+
+    学校夜里发癫会把活会话临时判 91001（几分钟自愈），单次就催用户换凭证
+    纯属白折腾——所以未达连续确认阈值时要说「等一等再试」。
+    """
     plugin = _plugin({"0030000000004301": _expired(), "0030000000014501": _expired()})
+    text = _call(plugin)
+    assert "凭证：⏳ 学校暂时拒绝了会话（91001），正在观察中" in text
+    assert "空调费：疑似凭证失效（学校抖动观察中）" in text
+
+
+def test_check_reports_confirmed_expiry_when_strikes_reached():
+    """连续确认达标 → 明确说凭证失效，并给出换凭证的指引。"""
+    plugin = _plugin({"0030000000004301": _expired(), "0030000000014501": _expired()})
+    plugin.store.data.setdefault("credential", {})["expired_strikes"] = 2
     text = _call(plugin)
     assert "凭证：⚠️ 学校已拒绝（retcode 91001 会话超时）" in text
     assert "空调费：凭证已失效" in text

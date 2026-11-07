@@ -19,12 +19,16 @@ GROUP = "qq:group:9"
 
 
 class _Ev:
-    def __init__(self, umo=UMO, private=True):
+    def __init__(self, umo=UMO, private=True, is_admin=True):
         self.unified_msg_origin = umo
         self._private = private
+        self._is_admin = is_admin
 
     def is_private_chat(self):
         return self._private
+
+    def is_admin(self):
+        return self._is_admin
 
     def plain_result(self, text):
         return text
@@ -90,6 +94,11 @@ class _Store:
 # ================= _notify_session_dead =================
 
 
+def _confirm_strikes(store, count=2):
+    """把连续 91001 计数顶到确认阈值（未达阈值不发失效通知）。"""
+    store.data.setdefault("credential", {})["expired_strikes"] = count
+
+
 def test_dead_notify_sends_and_records():
     store = _Store({UMO: _binding()})
     plugin = make_plugin(store=store)
@@ -101,10 +110,28 @@ def test_dead_notify_sends_and_records():
 
     plugin._send = _send
     binding = store.get_binding(UMO)
+    _confirm_strikes(store)
     asyncio.run(plugin._notify_session_dead(UMO, binding))
     assert sent == [UMO]
     assert binding["alert_state"]["dead_notified_at"] > 0
     assert store.saved >= 1
+
+
+def test_dead_notify_silent_before_confirmation():
+    """连续确认未达标时不该发失效通知（学校抖动别去骚扰用户）。"""
+    store = _Store({UMO: _binding()})
+    plugin = make_plugin(store=store)
+    sent = []
+
+    async def _send(umo, text):
+        sent.append(umo)
+        return True
+
+    plugin._send = _send
+    binding = store.get_binding(UMO)
+    _confirm_strikes(store, count=1)
+    asyncio.run(plugin._notify_session_dead(UMO, binding))
+    assert sent == []
 
 
 def test_dead_notify_dedupes_within_24h():
@@ -118,6 +145,7 @@ def test_dead_notify_dedupes_within_24h():
 
     plugin._send = _send
     binding = store.get_binding(UMO)
+    _confirm_strikes(store)
     asyncio.run(plugin._notify_session_dead(UMO, binding))
     asyncio.run(plugin._notify_session_dead(UMO, binding))
     assert len(sent) == 1  # 24h 内只提醒一次
@@ -133,6 +161,7 @@ def test_dead_notify_failure_not_recorded():
 
     plugin._send = _send
     binding = store.get_binding(UMO)
+    _confirm_strikes(store)
     asyncio.run(plugin._notify_session_dead(UMO, binding))
     assert "dead_notified_at" not in binding.get("alert_state", {})
 
@@ -164,6 +193,16 @@ def test_credential_group_denied():
     plugin = make_plugin(store=_Store())
     out = "".join(asyncio.run(_collect(plugin.cmd_credential(_Ev(GROUP, False), "JSESSIONID=x"))))
     assert "私聊" in out
+
+
+def test_credential_denied_for_non_admin():
+    """非管理员私聊也不能更新凭证（全局会话密钥，不能被路人覆盖）。"""
+    plugin = make_plugin(config={"hjnu_cookie": "keep"}, store=_Store())
+    out = "".join(
+        asyncio.run(_collect(plugin.cmd_credential(_Ev(is_admin=False), "JSESSIONID=BAD")))
+    )
+    assert "管理员" in out
+    assert plugin.config["hjnu_cookie"] == "keep"
 
 
 def test_credential_without_arg_shows_usage():
@@ -310,8 +349,8 @@ def _recorder():
     return sent, _send
 
 
-def test_poll_marks_credential_dead_and_notifies():
-    """91001 → 标记失效 + 发失效通知（这是失效期唯一的推送）。"""
+def test_poll_first_91001_is_only_suspect():
+    """第一次 91001：不发通知、不置 credential_dead（学校发癫防误报）。"""
     store = _Store({UMO: _two_fee_binding()})
     plugin = make_plugin(
         store=store,
@@ -323,11 +362,50 @@ def test_poll_marks_credential_dead_and_notifies():
     asyncio.run(plugin._poll_all())
 
     binding = store.get_binding(UMO)
+    assert sent == []
+    assert not binding.get("credential_dead")
+    assert store.data["credential"]["expired_strikes"] == 1
+
+
+def test_poll_marks_credential_dead_and_notifies():
+    """连续第二次 91001 → 标记失效 + 发失效通知（失效期唯一的推送）。"""
+    store = _Store({UMO: _two_fee_binding()})
+    plugin = make_plugin(
+        store=store,
+        hjnu=_KindProvider({AC_AID: _expired(), ELEC_AID: _expired()}),
+    )
+    sent, _send = _recorder()
+    plugin._send = _send
+
+    asyncio.run(plugin._poll_all())  # 第一次：观察期
+    asyncio.run(plugin._poll_all())  # 第二次：确认失效
+
+    binding = store.get_binding(UMO)
     assert binding["credential_dead"] is True
     assert len(sent) == 1  # 两个费种都失效，但 24h 去重后只发一条
     assert "凭证已失效" in sent[0][1]
     # 状态变化记进事件流（/电费 日志 可见）
     assert any(e["kind"] == "credential" for e in plugin._events)
+
+
+def test_poll_clears_strikes_when_school_accepts():
+    """学校重新认了会话 → 观察计数清零（不会攒着旧计数误判）。"""
+    store = _Store({UMO: _two_fee_binding()})
+    plugin = make_plugin(
+        store=store,
+        hjnu=_KindProvider({AC_AID: _expired(), ELEC_AID: _expired()}),
+    )
+    sent, _send = _recorder()
+    plugin._send = _send
+    asyncio.run(plugin._poll_all())
+    assert store.data["credential"]["expired_strikes"] == 1
+
+    plugin.hjnu = _KindProvider(
+        {AC_AID: _ok(50.0), ELEC_AID: _ok(50.0, "元")}
+    )
+    asyncio.run(plugin._poll_all())
+    assert store.data["credential"]["expired_strikes"] == 0
+    assert sent == []
 
 
 def test_daily_skipped_when_credential_dead():

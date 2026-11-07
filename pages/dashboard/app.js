@@ -61,11 +61,18 @@ function render() {
   var d = overview;
   var binds = d.bindings || [];
 
-  // 凭证状态横幅：cookie 已配置 ≠ 学校认。expired = 有会话拿到 91001 且无一路成功
+  // 凭证状态横幅：cookie 已配置 ≠ 学校认。
+  // expired = 连续确认失效；suspect = 见到 91001 但连续确认未达标（学校抖动观察中）
   var banner = document.getElementById("cred-banner");
   if (d.credential_state === "expired") {
     banner.classList.remove("hidden");
     banner.textContent = "🚨 学校凭证已失效（查询返回 91001）：重新获取 JSESSIONID 后私聊机器人发送「/电费 凭证 JSESSIONID=…」即可恢复，绑定与历史不会丢。";
+  } else if (d.credential_state === "suspect") {
+    banner.classList.remove("hidden");
+    banner.style.background = "rgba(217,119,6,0.12)";
+    banner.style.borderColor = "rgba(217,119,6,0.45)";
+    banner.style.color = "#d97706";
+    banner.textContent = "⏳ 学校暂时拒绝了会话（91001），正在观察中：多半是学校服务器抖动，几分钟内常自愈，先等 1~2 分钟。若连续多次都失败，请重新获取 JSESSIONID。";
   } else {
     banner.classList.add("hidden");
   }
@@ -84,6 +91,7 @@ function render() {
   var age = credAgeText(meta);
   var credCard =
     credState === "expired" ? { icon: "🔑", label: "学校凭证", value: "已失效" + (age ? " · " + age : ""), cls: "card-alert" }
+    : credState === "suspect" ? { icon: "🔑", label: "学校凭证", value: "观察中" + (age ? " · " + age : ""), cls: "card-warn" }
     : credState === "ok" ? { icon: "🔑", label: "学校凭证", value: "有效" + (age ? " · " + age : ""), cls: "card-success" }
     : d.cookie_ok ? { icon: "🔑", label: "学校凭证", value: "已配置" + (age ? " · " + age : ""), cls: "" }
     : { icon: "🔑", label: "学校凭证", value: "未配置", cls: "card-alert" };

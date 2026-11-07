@@ -17,6 +17,12 @@ from .base import BalanceResult, ElecProvider, QueryError
 
 SESSION_EXPIRED_CODE = "91001"
 
+# 91001 复验延迟（秒）。学校「发癫」时会把**还活着的会话**临时判成 91001
+# （实录：会话即生即死、几分钟后自愈），单次 91001 就宣判凭证失效会害用户
+# 白折腾重新提取凭证——这里隔一小段把同一请求原样重发一次，复验通过就当
+# 抖动处理。秒级抖动挡在 Provider 层，分钟级抖动挡在 main 层的连续确认计数。
+EXPIRED_RECHECK_DELAY = 2.5
+
 logger = logging.getLogger("astrbot.plugin.dorm_electric")
 
 
@@ -154,6 +160,27 @@ class HjnuProvider(ElecProvider):
         return resp.status_code, text, ""
 
     async def _post(self, path: str, fields: dict) -> dict:
+        """发请求、解析 JSON；91001 会隔一小段复验一次。
+
+        复验：学校发癫时会把活着的会话临时判成 91001，原样重发一次若通过，
+        说明只是抖动——直接当正常结果返回，不惊动用户去换凭证。
+        复验仍 91001 才交给调用方按「会话失效」处理。
+        """
+        data = await self._post_retry(path, fields)
+        if self._is_expired(data):
+            await asyncio.sleep(EXPIRED_RECHECK_DELAY)
+            logger.info("电费接口返回 91001，%.1fs 后复验一次（%s）", EXPIRED_RECHECK_DELAY, path)
+            data = await self._post_retry(path, fields)
+        return data
+
+    @staticmethod
+    def _is_expired(data: dict) -> bool:
+        return (
+            isinstance(data, dict)
+            and str(data.get("retcode", "")) == SESSION_EXPIRED_CODE
+        )
+
+    async def _post_retry(self, path: str, fields: dict) -> dict:
         # 5xx（如学校服务器偶发 502）自动换新连接重试 2 次
         last_err = ""
         for attempt in range(3):

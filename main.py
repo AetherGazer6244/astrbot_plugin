@@ -28,6 +28,7 @@ try:
     from . import webui
     from .formatting import (
         CREDENTIAL_HINT,
+        CREDENTIAL_SUSPECT_HINT,
         ROOM_PAGE_SIZE,
         alert_hint,
         credential_state,
@@ -68,6 +69,7 @@ except ImportError:  # 兜底：被以非包方式加载时
     import webui  # type: ignore
     from formatting import (  # type: ignore
         CREDENTIAL_HINT,
+        CREDENTIAL_SUSPECT_HINT,
         ROOM_PAGE_SIZE,
         alert_hint,
         credential_state,
@@ -183,7 +185,7 @@ def electric():
     PLUGIN_NAME,
     "Cecilian",
     "宿舍电费余额监控预警：低余额预警、每日播报、双费种同时查询、支持 AI 对话绑定与 WebUI 仪表盘",
-    "1.2.2",
+    "1.3.0",
 )
 class DormElectricPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -374,6 +376,87 @@ class DormElectricPlugin(Star):
             "room", "未知房间"
         )
 
+    # ================= 凭证失效判定（两层防线） =================
+    #
+    # 第一层（Provider）：91001 隔 EXPIRED_RECHECK_DELAY 秒原样重发一次，
+    #   复验通过就当学校抖动——挡秒级抖动。
+    # 第二层（这里）：91001 连续出现 CREDENTIAL_CONFIRM_STRIKES 次
+    #   （跨轮询/保活周期）才判定凭证失效并通知用户——挡分钟级抖动。
+    # 学校夜里「发癫」时活着的会话会被临时判 91001（实录：会话即生即死、
+    # 几分钟自愈），单次就催用户重新提取凭证纯属白折腾。
+    CREDENTIAL_CONFIRM_STRIKES: ClassVar[int] = 2
+
+    def _expired_strikes(self) -> int:
+        """连续 91001 计数（持久化在 store.data["credential"]，重启不清零）。"""
+        meta = self.store.data.get("credential") if self.store else None
+        if not isinstance(meta, dict):
+            return 0
+        try:
+            return int(meta.get("expired_strikes", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _credential_dead_confirmed(self) -> bool:
+        """连续确认次数达标 → 凭证确定失效。"""
+        return self._expired_strikes() >= self.CREDENTIAL_CONFIRM_STRIKES
+
+    def _credential_probe_enabled(self) -> bool:
+        """是否还有定时探测在跑（轮询或保活）——没有确认机制就别让用户干等。"""
+        return bool(
+            self._cfg_int("poll_interval_minutes", 20) > 0
+            or self._cfg_int("keepalive_interval_minutes", 8) > 0
+        )
+
+    def _credential_suspect_mode(self) -> bool:
+        """当前是否处于「疑似失效、观察中」阶段。
+
+        连续确认只由定时探测推进（轮询/保活）：交互查询不推进计数——
+        否则用户在抖动期间狂敲 /电费 查询 会把抖动顶成「确认失效」，
+        误报照旧。探测全关时没有确认机制，直接按失效呈现。
+        """
+        if self._credential_dead_confirmed():
+            return False
+        return self._credential_probe_enabled()
+
+    def _credential_hint_text(self) -> str:
+        """凭证失效提示文案：确认失效用确定语气，观察期用「疑似 + 等一等」。"""
+        return CREDENTIAL_SUSPECT_HINT if self._credential_suspect_mode() else CREDENTIAL_HINT
+
+    def _update_expired_strikes(self, *, ok: bool = False, expired: bool = False) -> int:
+        """更新连续 91001 计数并落盘，返回最新计数。
+
+        - 学校认（任一路拿到余额）→ 清零
+        - 学校明确拒绝（91001，已经过 Provider 层复验）→ +1
+        - 网络/接口失败 → 不动（抖动既不推进也不清除观察进度）
+        一个轮询/保活周期只调用一次（凭证是全局的，与绑定数无关）。
+        """
+        if not self.store:
+            return 0
+        meta = self.store.data.get("credential")
+        if not isinstance(meta, dict):
+            meta = {}
+            self.store.data["credential"] = meta
+        if ok:
+            if not meta.get("expired_strikes"):
+                # 计数本来就是 0：不必写盘。保活每 8 分钟一次，
+                # 无脑 force save 等于每 8 分钟重写一遍整份历史文件。
+                return 0
+            logger.info(f"[{PLUGIN_NAME}] 凭证被学校认可，连续 91001 观察计数清零")
+            meta["expired_strikes"] = 0
+            self.store.save(force=True)
+            return 0
+        if not expired:
+            return self._expired_strikes()
+        strikes = self._expired_strikes() + 1
+        meta["expired_strikes"] = strikes
+        self.store.save(force=True)
+        if strikes < self.CREDENTIAL_CONFIRM_STRIKES:
+            logger.info(
+                f"[{PLUGIN_NAME}] 学校拒绝会话（91001，连续第 {strikes} 次，"
+                f"达到 {self.CREDENTIAL_CONFIRM_STRIKES} 次才判定凭证失效）"
+            )
+        return strikes
+
     # ---- 纯格式化/统计函数：实现已平移到 formatting.py，这里保留静态方法别名，
     # ---- self._fee_name(...) 等全部调用点与测试引用（DormElectricPlugin._x）不变。
     _fee_name = staticmethod(fee_name)
@@ -433,6 +516,7 @@ class DormElectricPlugin(Star):
         results = await self._fetch_fees(binding)
         self._remember_raw(umo, results)
         keep_days = self._cfg_int("history_keep_days", 60)
+        suspect = self._credential_suspect_mode()
         lines = []
         ok_count = 0
         for kind, result in results.items():
@@ -443,7 +527,10 @@ class DormElectricPlugin(Star):
                 lines.append(self._fee_text(kind, result))
                 ok_count += 1
             elif result and result.session_expired:
-                lines.append(f"{self._fee_name(kind)}：凭证已失效")
+                if suspect:
+                    lines.append(f"{self._fee_name(kind)}：疑似凭证失效（学校抖动观察中）")
+                else:
+                    lines.append(f"{self._fee_name(kind)}：凭证已失效")
             elif result:
                 lines.append(f"{self._fee_name(kind)}：查询失败：{result.raw}")
         return lines, ok_count
@@ -549,12 +636,21 @@ class DormElectricPlugin(Star):
                 self._last_raw.pop(umo, None)
 
     async def _poll_all(self):
-        """轮询全部 hjnu 绑定，记录历史、触发预警（合并同会话）。"""
+        """轮询全部 hjnu 绑定，记录历史、触发预警（合并同会话）。
+
+        凭证判定两遍式：第一遍只采集各绑定结果（any_ok / any_expired），
+        循环外按周期统一更新连续 91001 计数（凭证是全局的，一个周期只记
+        一次，与绑定数无关），第二遍再按确认结果发通知 / 同步 credential_dead。
+        """
         if not self.store:
             return
         self._sweep_memory()
         keep_days = self._cfg_int("history_keep_days", 60)
         bindings = self.store.data.get("bindings", {})
+        outcomes: list[tuple[str, dict, bool, bool]] = []
+        cycle_ok = False
+        cycle_expired = False
+        cycle_net_fail = False
         for umo, binding in list(bindings.items()):
             try:
                 results = await self._fetch_fees(binding)
@@ -578,17 +674,14 @@ class DormElectricPlugin(Star):
                         )
                     elif result.session_expired:
                         any_expired = True
-                        await self._notify_session_dead(umo, binding)
                 if results:
-                    # 凭证埋点与 _sync_credential_state 同口径：任一路拿到余额
-                    # 即「学校认了」；全 91001 才算失效；网络/接口失败记失联。
                     if any_ok:
-                        self._touch_credential(ok=True)
+                        cycle_ok = True
                     elif any_expired:
-                        self._touch_credential(expired=True)
+                        cycle_expired = True
                     else:
-                        self._touch_credential(net_fail=True)
-                self._sync_credential_state(umo, binding, any_ok, any_expired)
+                        cycle_net_fail = True
+                outcomes.append((umo, binding, any_ok, any_expired))
                 self._record_event(
                     umo, "poll", f"轮询：{self._binding_label(binding)}"
                 )
@@ -598,6 +691,29 @@ class DormElectricPlugin(Star):
                 logger.error(
                     f"[{PLUGIN_NAME}] 轮询 {umo} 失败：{e!r}", exc_info=True
                 )
+        # 凭证埋点与连续 91001 计数：整轮一次（凭证是全局的，与绑定数无关）
+        # 写盘失败（磁盘满等）不能带崩整轮轮询——计数已更新在内存里，
+        # 下一轮再落盘即可。
+        try:
+            if cycle_ok:
+                self._touch_credential(ok=True)
+            elif cycle_expired:
+                self._touch_credential(expired=True)
+            elif cycle_net_fail:
+                self._touch_credential(net_fail=True)
+            self._update_expired_strikes(ok=cycle_ok, expired=cycle_expired)
+        except OSError as e:
+            logger.error(f"[{PLUGIN_NAME}] 凭证状态落盘失败：{e}")
+        confirmed = self._credential_dead_confirmed()
+        for umo, binding, any_ok, any_expired in outcomes:
+            try:
+                if any_expired and confirmed:
+                    await self._notify_session_dead(umo, binding)
+                # 未确认时（观察期）不置 credential_dead：否则一次抖动就
+                # 暂停每日播报，用户还以为余额查询彻底挂了。
+                self._sync_credential_state(umo, binding, any_ok, any_expired and confirmed)
+            except Exception as e:
+                logger.error(f"[{PLUGIN_NAME}] 同步凭证状态 {umo} 失败：{e!r}")
         try:
             self.store.save()
         except OSError as e:
@@ -815,7 +931,16 @@ class DormElectricPlugin(Star):
             await self.hjnu.list_areas(aid)
         except SessionExpiredError:
             self._touch_credential(expired=True)
-            logger.warning(f"[{PLUGIN_NAME}] 保活探测：凭证已失效（91001）")
+            self._update_expired_strikes(expired=True)
+            if not self._credential_dead_confirmed():
+                logger.warning(
+                    f"[{PLUGIN_NAME}] 保活探测：学校拒绝会话（91001），"
+                    "进入观察期（连续确认未达标，暂不打扰用户）"
+                )
+                return
+            logger.warning(
+                f"[{PLUGIN_NAME}] 凭证连续 {self.CREDENTIAL_CONFIRM_STRIKES} 次被拒，判定失效"
+            )
             bindings = self.store.data.get("bindings", {})
             for umo, binding in list(bindings.items()):
                 try:
@@ -830,6 +955,7 @@ class DormElectricPlugin(Star):
             )
         else:
             self._touch_credential(ok=True)
+            self._update_expired_strikes(ok=True)
             bindings = self.store.data.get("bindings", {})
             for umo, binding in list(bindings.items()):
                 try:
@@ -838,6 +964,10 @@ class DormElectricPlugin(Star):
                     logger.error(f"[{PLUGIN_NAME}] 保活恢复处理 {umo} 失败：{e!r}")
 
     async def _notify_session_dead(self, umo: str, binding: dict):
+        # 连续确认门：未达到 CREDENTIAL_CONFIRM_STRIKES 前只是「疑似失效」，
+        # 不打扰用户（学校发癫时单次 91001 几分钟就自愈）。
+        if not self._credential_dead_confirmed():
+            return
         state = binding.setdefault("alert_state", {})
         now = time.time()
         last = float(state.get("dead_notified_at", 0) or 0)
@@ -2046,6 +2176,7 @@ class DormElectricPlugin(Star):
             store=self.store,
             config=self.config,
             last_room=self._last_room,
+            credential_hint=self._credential_hint_text,
         )
 
     async def _resolve_room(self, umo: str, hint: str) -> tuple[dict | None, str | None]:
@@ -2166,7 +2297,7 @@ class DormElectricPlugin(Star):
             "/电费 预警线 [n] — 本会话自定义预警线（取消=恢复全局；仅私聊）\n"
             "/电费 解绑 — 取消监控（仅私聊）\n"
             "/电费 查询 — 同时查询空调费和宿舍电费\n"
-            "/电费 凭证 <JSESSIONID=...> — 更新会话凭证（仅限私聊，热更新）\n"
+            "/电费 凭证 <JSESSIONID=...> — 更新会话凭证（仅限管理员私聊，热更新）\n"
             "/电费 历史 [n] — 查看最近 n 天每日余额（默认 7 天，最多 60 天）\n"
             "/电费 日志 [n] — 查看最近 n 条事件 + 最近一次原始返回（默认 20，最多 100）\n"
             "/电费 状态 — 查看绑定与运行状态\n"
@@ -2241,7 +2372,8 @@ class DormElectricPlugin(Star):
 
         results = await self._fetch_fees(binding)
         self._remember_raw(umo, results)
-        state = self._credential_state(results)
+        suspect = self._credential_suspect_mode()
+        state = self._credential_state(results, suspect=suspect)
         fees = self._fee_bindings(binding)
         lines = [
             f"🔎 电费自检 {label}",
@@ -2258,7 +2390,9 @@ class DormElectricPlugin(Star):
         lines.append("实时查询：")
         lines.extend(
             "  " + line
-            for line in self._format_fee_results(results, include_missing=True)
+            for line in self._format_fee_results(
+                results, include_missing=True, suspect=suspect
+            )
         )
         events = [ev for ev in self._events if ev.get("umo") == umo][-5:]
         lines.append("最近事件（新→旧）：")
@@ -2283,7 +2417,7 @@ class DormElectricPlugin(Star):
         用户说「凭证还有效吗」「怎么没提醒我」「电费是不是查不了/挂了」「检查一下电费查询」
         这类话时调用。
         凭证（JSESSIONID）永远不要向用户索要、不要转述或保存：用户自己贴出来时，
-        让他私下发送 /电费 凭证 JSESSIONID=… 更新。
+        让管理员私下发送 /电费 凭证 JSESSIONID=… 更新（该指令仅限管理员）。
         """
         if not self._ai_enabled():
             return "电费 AI 工具已被插件配置关闭。"
@@ -2593,11 +2727,22 @@ class DormElectricPlugin(Star):
 
     @electric.command("凭证")
     async def cmd_credential(self, event: AstrMessageEvent, credential: str | None = None):
-        """更新缴费系统会话凭证（JSESSIONID，仅限私聊）"""
+        """更新缴费系统会话凭证（JSESSIONID，仅限管理员私聊）"""
         if not event.is_private_chat():
             yield event.plain_result(
                 "🔒 凭证是全局会话密钥，请私聊机器人发送 /电费 凭证 更新。"
             )
+            return
+        if not event.is_admin():
+            # 凭证是全局会话密钥：谁都能改的话，任意私聊用户一句
+            # 「/电费 凭证 JSESSIONID=垃圾」就能让全部会话的查询瘫痪。
+            # AstrBot 的 is_admin = 发送者 id 在配置 admins_id 里（webchat 下
+            # 发送者 id 是 WebUI 用户名，extract_cookie.py 以管理员账号推送，
+            # 链路不受影响）。
+            logger.warning(
+                f"[{PLUGIN_NAME}] 非管理员尝试更新凭证，已拒绝（{event.unified_msg_origin}）"
+            )
+            yield event.plain_result("⛔ 凭证是全局会话密钥，只有管理员可以更新。")
             return
         if not credential:
             yield event.plain_result(
@@ -2620,6 +2765,9 @@ class DormElectricPlugin(Star):
             # 凭证年龄埋点：set_at 是「凭证寿命」的起点。用户动作必须立刻
             # 落盘（60 秒去抖会让进程崩溃时丢掉寿命起点，仪表盘就只能说「≥」）
             self.store.data.setdefault("credential", {})["set_at"] = time.time()
+            # 凭证刚换新：连续 91001 观察计数清零，别让旧凭证攒下的第 1 次
+            # 计数把新凭证的首次抖动直接顶成「确认失效」。
+            self._update_expired_strikes(ok=True)
             self.store.save(force=True)
         umo = event.unified_msg_origin
         binding = self.store.get_binding(umo)

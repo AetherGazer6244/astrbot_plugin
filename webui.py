@@ -72,11 +72,17 @@ def binding_item(plugin, umo: str, binding: dict) -> dict:
 def credential_state(plugin, bindings: dict) -> str:
     """从各会话最近一次查询结果推断学校凭证状态（不发额外请求）。
 
-    - "expired"：有会话拿到 91001，且没有任何一路拿到余额 → 凭证基本确定失效
+    - "expired"：有会话拿到 91001、无任何一路拿到余额，且连续确认计数达标
+      （插件 CREDENTIAL_CONFIRM_STRIKES，跨轮询/保活周期）→ 凭证确定失效
+    - "suspect"：见到 91001 但连续确认未达标 → 学校抖动观察期（学校发癫时
+      会话即生即死、几分钟自愈），别渲染成红条吓用户去换凭证
     - "ok"：任一路拿到过余额 → 学校认了会话
     - "unknown"：没数据（没绑定/还没轮询过/网络失败）——不能断言，别吓用户
 
     cookie 已配置但学校不认（「已配置」≠「有效」）正是 v1.1.x 仪表盘的盲区。
+
+    ⚠️ 判定口径必须与 main._credential_suspect_mode 一致：探测（轮询/保活）
+    全关时没有连续确认机制，不能一直挂在「观察中」——直接判失效。
     """
     expired = False
     ok_seen = False
@@ -89,6 +95,12 @@ def credential_state(plugin, bindings: dict) -> str:
             elif getattr(result, "ok", False):
                 ok_seen = True
     if expired and not ok_seen:
+        confirmed = getattr(plugin, "_credential_dead_confirmed", None)
+        if callable(confirmed) and confirmed():
+            return "expired"
+        suspect_mode = getattr(plugin, "_credential_suspect_mode", None)
+        if callable(suspect_mode) and suspect_mode():
+            return "suspect"
         return "expired"
     if ok_seen:
         return "ok"

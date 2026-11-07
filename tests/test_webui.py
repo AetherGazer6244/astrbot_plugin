@@ -28,6 +28,9 @@ class _FakeStore:
     def get_binding(self, umo):
         return self.data["bindings"].get(umo)
 
+    def save(self, force=False):
+        self.saved += 1
+
 
 class _FakeContext:
     def __init__(self, fail=False):
@@ -285,8 +288,34 @@ def _res(ok=True, expired=False):
     )
 
 
-def test_credential_state_expired_when_all_sessions_rejected():
+def test_credential_state_suspect_when_confirmation_not_reached():
+    """见到 91001 但连续确认未达标 → 「观察中」，别渲染成红条吓用户。"""
     plugin = _plugin(bindings={UMO: _binding()})
+    plugin._last_raw[UMO] = {
+        "at": time.time(),
+        "results": {"ac": _res(expired=True)},
+    }
+    assert credential_state(plugin, {UMO: {}}) == "suspect"
+
+
+def test_credential_state_expired_when_all_sessions_rejected():
+    """连续确认达标 → 确定失效。"""
+    plugin = _plugin(bindings={UMO: _binding()})
+    plugin._last_raw[UMO] = {
+        "at": time.time(),
+        "results": {"ac": _res(expired=True)},
+    }
+    plugin.store.data.setdefault("credential", {})["expired_strikes"] = 2
+    assert credential_state(plugin, {UMO: {}}) == "expired"
+
+
+def test_credential_state_expired_when_no_probe_enabled():
+    """探测全关 → 没有连续确认机制，直接判失效（不能永远挂「观察中」）。"""
+    plugin = _plugin(
+        bindings={UMO: _binding()},
+        poll_interval_minutes=0,
+        keepalive_interval_minutes=0,
+    )
     plugin._last_raw[UMO] = {
         "at": time.time(),
         "results": {"ac": _res(expired=True)},
@@ -325,6 +354,7 @@ def test_overview_exposes_credential_state():
         "at": time.time(),
         "results": {"ac": _res(expired=True)},
     }
+    plugin.store.data.setdefault("credential", {})["expired_strikes"] = 2
     resp = _call(plugin, plugin._web_overview())
     assert resp["data"]["credential_state"] == "expired"
     raw = json.dumps(resp, ensure_ascii=False)

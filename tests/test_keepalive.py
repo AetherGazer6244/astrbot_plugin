@@ -28,12 +28,16 @@ _CFG = {"hjnu_cookie": "JSESSIONID=x", "fee_items": {AID: "空调费"}}
 
 
 class _Ev:
-    def __init__(self, umo=UMO, private=True):
+    def __init__(self, umo=UMO, private=True, is_admin=True):
         self.unified_msg_origin = umo
         self._private = private
+        self._is_admin = is_admin
 
     def is_private_chat(self):
         return self._private
+
+    def is_admin(self):
+        return self._is_admin
 
     def plain_result(self, text):
         return text
@@ -172,7 +176,8 @@ def test_keepalive_ok_touches_and_clears_dead_flag():
     assert store.get_binding(UMO)["credential_dead"] is False
 
 
-def test_keepalive_expired_notifies_and_marks_dead():
+def test_keepalive_first_expiry_only_enters_observation():
+    """第一次 91001：只进观察期，不标记失效、不发通知（学校发癫防误报）。"""
     store = _Store({UMO: _binding()})
     plugin = make_plugin(
         config=_CFG, store=store, hjnu=_Areas(SessionExpiredError("会话已超时"))
@@ -181,6 +186,24 @@ def test_keepalive_expired_notifies_and_marks_dead():
     plugin._send = _send
 
     asyncio.run(plugin._keepalive_tick())
+
+    assert store.data["credential"]["last_expired_at"] > 0
+    assert store.data["credential"]["expired_strikes"] == 1
+    assert not store.get_binding(UMO).get("credential_dead")
+    assert sent == []
+
+
+def test_keepalive_expired_notifies_and_marks_dead():
+    """连续第二次 91001 → 标记失效 + 发通知（失效期唯一的推送）。"""
+    store = _Store({UMO: _binding()})
+    plugin = make_plugin(
+        config=_CFG, store=store, hjnu=_Areas(SessionExpiredError("会话已超时"))
+    )
+    sent, _send = _recorder()
+    plugin._send = _send
+
+    asyncio.run(plugin._keepalive_tick())  # 第一次：观察期
+    asyncio.run(plugin._keepalive_tick())  # 第二次：确认失效
 
     assert store.data["credential"]["last_expired_at"] > 0
     assert store.get_binding(UMO)["credential_dead"] is True

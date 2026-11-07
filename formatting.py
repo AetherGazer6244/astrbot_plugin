@@ -21,6 +21,14 @@ CREDENTIAL_HINT = (
     "tools/extract_cookie.py 提取，详见 README）"
 )
 
+# 疑似失效（连续确认未到位）时的提示：学校发癫时活会话会被临时判 91001，
+# 几分钟自愈——先让用户等一等重试，别直接催他去重新提取凭证。
+CREDENTIAL_SUSPECT_HINT = (
+    "⏳ 学校暂时拒绝了会话（91001）：多半是学校服务器抖动，几分钟内常自愈。\n"
+    "先等 1~2 分钟重试一次；若连续多次都失败，再重新获取 JSESSIONID 私聊发送："
+    "/电费 凭证 JSESSIONID=xxxx"
+)
+
 
 def fee_name(kind: str) -> str:
     return "空调费" if kind == "ac" else "宿舍电费"
@@ -31,12 +39,15 @@ def fee_text(kind: str, result) -> str:
 
 
 def format_fee_results(
-    results: dict[str, object], include_missing: bool = False
+    results: dict[str, object], include_missing: bool = False, suspect: bool = False
 ) -> list[str]:
     """把查询结果格式化成按费种分行的文本。
 
     include_missing=True 时把「连响应都没有」（网络/学校 5xx）的费种也列出来，
     /电费 检查 用它来避免明细整段空白、看不出是哪一路失败。
+
+    suspect=True 时把 91001 渲染成「疑似凭证失效（学校抖动观察中）」——
+    连续确认次数还没到，别把学校抖动说成凭证过期（用户白折腾一轮）。
     """
     lines = []
     for kind in ("ac", "elec"):
@@ -50,7 +61,10 @@ def format_fee_results(
         if result.ok and result.value is not None:
             lines.append(fee_text(kind, result))
         elif result.session_expired:
-            lines.append(f"{fee_name(kind)}：凭证已失效")
+            if suspect:
+                lines.append(f"{fee_name(kind)}：疑似凭证失效（学校抖动观察中）")
+            else:
+                lines.append(f"{fee_name(kind)}：凭证已失效")
         else:
             lines.append(f"{fee_name(kind)}：查询失败（{result.raw}）")
     return lines
@@ -158,7 +172,7 @@ def history_stats(history: list[dict]) -> dict | None:
     }
 
 
-def credential_state(results: dict) -> str:
+def credential_state(results: dict, suspect: bool = False) -> str:
     """由一次真实查询的结果判定凭证状态（供 /电费 检查 复用）。
 
     ⚠️ 与 /电费 状态 无关：那条指令显示的「凭证：已配置」只表示 hjnu_cookie
@@ -168,6 +182,9 @@ def credential_state(results: dict) -> str:
     判定顺序很重要：先看有没有取到余额（说明学校认这个会话），
     再看是不是 91001（学校明确拒绝），最后才是网络/学校抖动——
     反过来会把学校夜间故障误报成「凭证过期」，害用户白折腾一轮重新提取。
+
+    suspect=True 表示「连续确认还没到、正在观察」：此时 91001 多半是学校
+    抖动，文案要给出「等一等再试」的出路，而不是催用户重新提取凭证。
     """
     values = list(results.values())
     ok = [r for r in values if r is not None and r.ok and r.value is not None]
@@ -179,6 +196,11 @@ def credential_state(results: dict) -> str:
             return "⚠️ 仅部分费种可用（详见下方明细）"
         return "✅ 有效（学校接口已接受本次查询）"
     if expired:
+        if suspect:
+            return (
+                "⏳ 学校暂时拒绝了会话（91001），正在观察中："
+                "多半是学校服务器抖动，几分钟内常自愈，先等 1~2 分钟重试"
+            )
         return "⚠️ 学校已拒绝（retcode 91001 会话超时），需重新提取 JSESSIONID"
     if all(r is None for r in values):
         return "⚠️ 学校接口不可用（网络异常或学校无响应），凭证状态未知，请稍后 /电费 查询 重试"

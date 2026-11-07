@@ -12,7 +12,7 @@ import time
 
 import httpx
 import pytest
-from astrbot_plugin_dorm_electric.main import CREDENTIAL_HINT
+from astrbot_plugin_dorm_electric.main import CREDENTIAL_HINT, CREDENTIAL_SUSPECT_HINT
 from astrbot_plugin_dorm_electric.providers import http_json
 from astrbot_plugin_dorm_electric.providers.base import BalanceResult
 from astrbot_plugin_dorm_electric.providers.http_json import (
@@ -112,10 +112,11 @@ def test_network_error_retries(monkeypatch):
 
 
 def test_91001_maps_to_session_expired(monkeypatch):
+    """91001 会被复验一次；复验仍是 91001 才判失效（学校抖动别误报）。"""
     provider, calls = _provider([(200, json.dumps(EXPIRED))], monkeypatch)
     result = asyncio.run(provider.query_room(ROOM_PARAMS))
     assert result.session_expired and not result.ok
-    assert len(calls) == 1
+    assert len(calls) == 2  # 原请求 + 复验一次
 
 
 def test_5xx_rebuild_does_not_break_concurrent_peer(monkeypatch):
@@ -151,7 +152,26 @@ class _ExpireMidScan:
 
 
 def test_midscan_expiry_reports_credential_hint():
+    """扫描途中会话过期 → 如实报凭证问题，不是「没找到房间」。
+
+    默认开着保活探测，连续确认未达标 → 提示「疑似失效，等一等」。
+    """
     plugin = make_plugin(config={"fee_items": {"aid": "x"}}, hjnu=_ExpireMidScan())
+    params, err = asyncio.run(plugin._resolve_room("qq:private:1", "817"))
+    assert params is None
+    assert err == CREDENTIAL_SUSPECT_HINT
+
+
+def test_midscan_expiry_reports_confirmed_hint_without_probe():
+    """探测全关 → 没有连续确认机制，直接给确定的失效提示。"""
+    plugin = make_plugin(
+        config={
+            "fee_items": {"aid": "x"},
+            "poll_interval_minutes": 0,
+            "keepalive_interval_minutes": 0,
+        },
+        hjnu=_ExpireMidScan(),
+    )
     params, err = asyncio.run(plugin._resolve_room("qq:private:1", "817"))
     assert params is None
     assert err == CREDENTIAL_HINT
